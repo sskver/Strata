@@ -948,6 +948,17 @@ const TcPlan& tc_plan() {
     p = std::move(np);
     return *p;
 }
+// Down-only tensor-core products (STRATA_PREFILL_FP16TC_DOWN=0 turns them off, as does STRATA_PREFILL_FP16TC=0): a layer
+// whose down matrix is native Q2_0 runs fp16tc::down on the gathered group slots, whatever its gate/up format.
+inline bool tc_down_layer(const strata::kernels::cpu::ExpertLayout& lay, size_t l) {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PREFILL_FP16TC_DOWN");
+        return fp16tc_enabled() && (e == nullptr || std::atoi(e) != 0);
+    }();
+    if (!on || !lay.native || l >= lay.fmt.size() || !fp16tc::available()) return false;
+    const auto& f = lay.fmt[l];
+    return f.d_type == 42 && f.n_embd % 128 == 0 && f.n_ff % 64 == 0 && f.d_row == 18 * (size_t) f.n_ff / 64;
+}
 // The compact GU/H walk (default on; STRATA_PREFILL_FP16TC=0 keeps the MMQ reference).  Only where tc_plan says this
 // device and pack take it, only when the fused walk is not taking the layer (its GU/H are grouping tables, not the
 // compact layout), and only when the streamed walk can split a 16-expert group into subbatches that fit the compact
@@ -3375,6 +3386,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         };
                         // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                         // expert) is released once the blob is read
+                        const bool tc_down_l = use_mmq && tc_down_layer(lay, (size_t) l);
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                             const int32_t e = order[j];
                             pt.mark(kPfDequant, cs);
@@ -3420,7 +3432,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (GROUPS + 1);
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
-                                m.mmq_ctx->run(dn, m.cs);
+                                if (tc_down_l && ngx <= fp16tc::kMaxBatch) {
+                                    const auto& fd = lay.fmt[(size_t) l];
+                                    fp16tc::Geom geo{};
+                                    geo.n_embd = (int) fd.n_embd; geo.n_ff = (int) fd.n_ff;
+                                    geo.gu_row = fd.gu_row; geo.d_row = fd.d_row; geo.up_off = fd.up_off;
+                                    fp16tc::Batch bt;
+                                    bt.n = ngx;
+                                    bt.max_rows = (int) maxr;
+                                    for (int i = 0; i < ngx; ++i) bt.down[i] = m.grp_d + (size_t) i * mmq_db;
+                                    fp16tc::down(bt, geo, dn.bounds, m.Hq, nr, m.Dm, N, r0, m.cs);
+                                } else {
+                                    m.mmq_ctx->run(dn, m.cs);
+                                }
                                 return true;
                             }
                             const int q = (int) (j % DQ);
