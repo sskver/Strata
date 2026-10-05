@@ -32,6 +32,7 @@
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/moe_fp16tc.hpp"
+#include "strata/prefill/moe_fp16tc_iq.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/prefill/kernels.hpp"
 
@@ -958,6 +959,18 @@ inline bool tc_down_layer(const strata::kernels::cpu::ExpertLayout& lay, size_t 
     if (!on || !lay.native || l >= lay.fmt.size() || !fp16tc::available()) return false;
     const auto& f = lay.fmt[l];
     return f.d_type == 42 && f.n_embd % 128 == 0 && f.n_ff % 64 == 0 && f.d_row == 18 * (size_t) f.n_ff / 64;
+}
+// Gate/up tensor-core products for the native i-quant layers (STRATA_PREFILL_IQ_HMMA=0 turns them off, as does
+// STRATA_PREFILL_FP16TC=0): a layer whose gate/up type is one of IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S (n_embd 2560,
+// n_ff 640) runs fp16tc_iq::gu on the gathered group slots instead of MMQ's dp4a product.
+inline bool tc_iq_gu_layer(const strata::kernels::cpu::ExpertLayout& lay, size_t l) {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PREFILL_IQ_HMMA");
+        return fp16tc_enabled() && (e == nullptr || std::atoi(e) != 0);
+    }();
+    if (!on || !lay.native || l >= lay.fmt.size() || !fp16tc_iq::available()) return false;
+    const auto& f = lay.fmt[l];
+    return fp16tc_iq::supported(f.gu_type, (int64_t) f.n_embd, (int64_t) f.n_ff);
 }
 // The compact GU/H walk (default on; STRATA_PREFILL_FP16TC=0 keeps the MMQ reference).  Only where tc_plan says this
 // device and pack take it, only when the fused walk is not taking the layer (its GU/H are grouping tables, not the
@@ -3387,6 +3400,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                         // expert) is released once the blob is read
                         const bool tc_down_l = use_mmq && tc_down_layer(lay, (size_t) l);
+                        const bool tc_iq_gu_l = use_mmq && tc_iq_gu_layer(lay, (size_t) l);
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                             const int32_t e = order[j];
                             pt.mark(kPfDequant, cs);
@@ -3423,7 +3437,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
-                                m.mmq_ctx->run(gu, m.cs);
+                                if (!(tc_iq_gu_l && fp16tc_iq::gu(mmq_gt, m.grp_gu, mmq_gub, ngx, maxr, gu.bounds, m.Xq,
+                                                                  (int64_t) (T * K), m.GU, 1280, m.cs)))
+                                    m.mmq_ctx->run(gu, m.cs);
                                 mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
                                 pt.mark(kPfGemmD, cs);
                                 mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
