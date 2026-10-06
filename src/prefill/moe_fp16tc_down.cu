@@ -57,6 +57,7 @@ constexpr int AP = 72, WP = 72;                        // smem leading dims (hal
 constexpr int ASZ = MCAP * AP, SSZ = ASZ + BN * WP;    // halves per stage
 constexpr int SMEM = 2 * SSZ * 2;                      // bytes: two stages (90 KB)
 constexpr int MAXN = 64, LMAX = 256;                   // experts per launch, items per block
+struct DBlobs { const uint8_t* p[MAXN]; };   // expert z's down matrix starts at p[z]
 constexpr int MIN_ROWS = 64;                           // below this group max_rows the caller's path is as fast (see down())
 __host__ __device__ constexpr int row_bytes(int t) { return t == T_Q2_0 ? FF / 64 * 18 : FF / 32 * 18; }
 
@@ -163,7 +164,7 @@ __device__ __noinline__ void build_items(const int* s_b, int n, uint32_t* s_list
 // (MF of them) and SPAN / 16 column fragments.  RW 2 (6 x 2 fragments) is the gate/up kernel's layout.
 template <int WT, int RW, int PF>
 __global__ void __launch_bounds__(NT, 1)
-down_kernel(const uint8_t* __restrict__ w, size_t eb, int n, int yt, const int32_t* __restrict__ bounds,
+down_kernel(const DBlobs dw, int n, int yt, const int32_t* __restrict__ bounds,
             const void* __restrict__ act, int64_t act_rows, float* __restrict__ dst, int64_t ld_dst, int64_t dst_row_base) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
@@ -210,7 +211,7 @@ down_kernel(const uint8_t* __restrict__ w, size_t eb, int n, int yt, const int32
         ARaw ar[PF][AT];
         auto load = [&](auto pc, const Item& t, int k0) {
             constexpr int P = decltype(pc)::value;
-            const uint8_t* wz = w + (size_t) t.z * eb + (size_t) (t.cx * BN) * RB;
+            const uint8_t* wz = dw.p[t.z] + (size_t) (t.cx * BN) * RB;
 #pragma unroll
             for (int u = 0; u < WU; ++u) {
                 const int unit = pt + u * PT, row = unit >> 1, j = unit & 1;
@@ -362,9 +363,9 @@ down_kernel(const uint8_t* __restrict__ w, size_t eb, int n, int yt, const int32
 struct DevInfo { bool attr[2][2] = {}; int classes = 0; };
 
 template <int WT, int RW, int PF>
-void launch(const void* w, size_t eb, int n, int yt, int classes, const int32_t* bounds, const void* hq, int64_t hq_rows,
+void launch(const DBlobs& dw, int n, int yt, int classes, const int32_t* bounds, const void* hq, int64_t hq_rows,
             float* dst, int64_t ld_dst, int64_t dst_row_base, cudaStream_t s) {
-    down_kernel<WT, RW, PF><<<NCB * classes, NT, SMEM, s>>>((const uint8_t*) w, eb, n, yt, bounds, hq, hq_rows, dst, ld_dst,
+    down_kernel<WT, RW, PF><<<NCB * classes, NT, SMEM, s>>>(dw, n, yt, bounds, hq, hq_rows, dst, ld_dst,
                                                         dst_row_base);
     ck(cudaGetLastError(), "down_kernel");
 }
@@ -409,11 +410,12 @@ bool available() {
 
 bool supported(int d_type, int64_t n_embd, int64_t n_ff) { return type_ok(d_type) && n_embd == N && n_ff == FF; }
 
-bool down(int d_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
-          const void* hq, int64_t hq_rows, float* dst, int64_t ld_dst, int64_t dst_row_base, void* stream) {
+static bool down_run(int d_type, const DBlobs& dw, int n_experts, int64_t max_rows, const int32_t* bounds, const void* hq,
+                     int64_t hq_rows, float* dst, int64_t ld_dst, int64_t dst_row_base, void* stream) {
     if (!type_ok(d_type) || n_experts <= 0 || n_experts > MAXN || hq_rows <= 0) return false;
     if (ld_dst < N || ld_dst % 4 != 0) return false;
-    if (expert_bytes < (size_t) N * row_bytes(d_type) || expert_bytes % 2 != 0 || (uintptr_t) w % 2 != 0) return false;
+    for (int i = 0; i < n_experts; ++i)
+        if (dw.p[i] == nullptr || (uintptr_t) dw.p[i] % 2 != 0) return false;   // 16-bit weight loads
     if (((uintptr_t) hq | (uintptr_t) dst) % 16 != 0) return false;   // 16-byte activation loads / output stores
     if (max_rows <= 0) return true;                                    // nothing to compute
     // Light groups (under 64 rows an expert, e.g. a 2048-token chunk) leave the MMA idle and the producers
@@ -424,9 +426,26 @@ bool down(int d_type, const void* w, size_t expert_bytes, int n_experts, int64_t
     const int classes = prepare(d_type);
     if (classes <= 0 || (int64_t) n_experts * yt > (int64_t) classes * LMAX) return false;   // the per-block item list
     const cudaStream_t s = (cudaStream_t) stream;
-    if (d_type == T_Q2_0) launch<T_Q2_0, 2, 1>(w, expert_bytes, n_experts, (int) yt, classes, bounds, hq, hq_rows, dst, ld_dst, dst_row_base, s);
-    else launch<T_IQ4_NL, 2, 1>(w, expert_bytes, n_experts, (int) yt, classes, bounds, hq, hq_rows, dst, ld_dst, dst_row_base, s);
+    if (d_type == T_Q2_0) launch<T_Q2_0, 2, 1>(dw, n_experts, (int) yt, classes, bounds, hq, hq_rows, dst, ld_dst, dst_row_base, s);
+    else launch<T_IQ4_NL, 2, 1>(dw, n_experts, (int) yt, classes, bounds, hq, hq_rows, dst, ld_dst, dst_row_base, s);
     return true;
+}
+
+bool down(int d_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
+          const void* hq, int64_t hq_rows, float* dst, int64_t ld_dst, int64_t dst_row_base, void* stream) {
+    if (!type_ok(d_type) || n_experts <= 0 || n_experts > MAXN || !w) return false;
+    if (expert_bytes < (size_t) N * row_bytes(d_type) || expert_bytes % 2 != 0) return false;
+    DBlobs dw;
+    for (int i = 0; i < n_experts; ++i) dw.p[i] = (const uint8_t*) w + (size_t) i * expert_bytes;
+    return down_run(d_type, dw, n_experts, max_rows, bounds, hq, hq_rows, dst, ld_dst, dst_row_base, stream);
+}
+
+bool down_blobs(int d_type, const uint8_t* const* down_ptrs, int n_experts, int64_t max_rows, const int32_t* bounds,
+                const void* hq, int64_t hq_rows, float* dst, int64_t ld_dst, int64_t dst_row_base, void* stream) {
+    if (!type_ok(d_type) || !down_ptrs || n_experts <= 0 || n_experts > MAXN) return false;
+    DBlobs dw;
+    for (int i = 0; i < n_experts; ++i) dw.p[i] = down_ptrs[i];
+    return down_run(d_type, dw, n_experts, max_rows, bounds, hq, hq_rows, dst, ld_dst, dst_row_base, stream);
 }
 
 }  // namespace strata::prefill::fp16tc_down

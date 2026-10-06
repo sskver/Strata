@@ -2998,13 +2998,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                                 const size_t q = j % MMQ_GROUP;
+                                // Direct group (STRATA_PREFILL_DIRECT=0 turns it off): the group's two tensor-core kernels read
+                                // the experts' own blobs instead of the gathered copies (the gather is 3% of a prompt's GPU
+                                // time).  Only for a whole group no early flush touched, with rows enough for the down kernel
+                                // (lighter groups take fp16tc::down / MMQ, which read gathered slots).  The ring slots are then
+                                // released after the products that read them, below.
+                                static const bool direct_on = [] {
+                                    const char* e = std::getenv("STRATA_PREFILL_DIRECT");
+                                    return e == nullptr || std::atoi(e) != 0;
+                                }();
+                                bool direct_group = false;
                                 if (group_gather) {
                                     gg.blob[q] = blob_dev;
                                     gg.n = (int) q + 1;
                                     if (slot >= 0) gg_slots[gg_nslots++] = slot;
                                     if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
-                                    flush();
-                                    gg = mmq::GatherGroup{};
+                                    if (direct_on && tc_iq_gu_l && tc_down2_l && gg.first == 0) {
+                                        int64_t mr = 0;
+                                        for (size_t i = j - q; i <= j; ++i) mr = std::max<int64_t>(mr, m.cnt[(size_t) order[i]]);
+                                        direct_group = mr >= 64;
+                                    }
+                                    if (!direct_group) {
+                                        flush();
+                                        gg = mmq::GatherGroup{};
+                                    }
                                 } else if (lay.native) {
                                     const auto& f = lay.fmt[(size_t) l];
                                     mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
@@ -3021,9 +3038,33 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 int64_t maxr = 0;
                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                                 pt.mark(kPfGemmGU, cs);
-                                // the zeroed tail after the group's last expert (see MMQ_TAIL)
-                                cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
-                                cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                                bool gathered = !direct_group;
+                                // flush()'s gather for a direct group whose kernels declined (the copy wait is done below)
+                                auto gather_group = [&]() {
+                                    if (gathered) return;
+                                    gathered = true;
+                                    const auto& f = lay.fmt[(size_t) l];
+                                    if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
+                                                                  m.grp_d, mmq_db, m.cs)) {
+                                        for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
+                                            const uint8_t* b = gg.blob[i];
+                                            mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
+                                                               m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs);
+                                        }
+                                    }
+                                    cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
+                                    cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                                };
+                                if (direct_group && gg_nslots > 0) {   // the copies land in order: the last one covers the others
+                                    pt.mark(kPfWaitCopy, cs);
+                                    cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
+                                    pt.mark(kPfGemmGU, cs);
+                                }
+                                if (!direct_group) {
+                                    // the zeroed tail after the group's last expert (see MMQ_TAIL)
+                                    cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
+                                    cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                                }
                                 mmq::Product gu;
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
@@ -3036,10 +3077,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     return e == nullptr || std::atoi(e) != 0;
                                 }();
                                 static const bool dbg_h = std::getenv("STRATA_DBG_NAN") != nullptr;
-                                const bool fused_gu = iq_fuse && tc_iq_gu_l && lay.native &&
-                                                      fp16tc_iq::gu_swiglu_q8_1(mmq_gt, m.grp_gu, mmq_gub, ngx, maxr, gu.bounds,
-                                                                                m.Xq, (int64_t) (T * K), dbg_h ? m.H : nullptr,
-                                                                                640, mmq_dt, m.Hq, m.cs);
+                                bool fused_dir = false;   // a direct group's gate/up from the experts' own blobs
+                                if (direct_group && iq_fuse) {
+                                    const auto& fd = lay.fmt[(size_t) l];
+                                    const uint8_t* gub[MMQ_GROUP];
+                                    for (int i = 0; i < ngx; ++i) gub[i] = gg.blob[i];
+                                    fused_dir = fp16tc_iq::gu_swiglu_q8_1_blobs(
+                                        mmq_gt, gub, (ptrdiff_t) fd.up_off - (ptrdiff_t) (mmq_gub / 2), ngx, maxr, gu.bounds,
+                                        m.Xq, (int64_t) (T * K), dbg_h ? m.H : nullptr, 640, mmq_dt, m.Hq, m.cs);
+                                }
+                                if (direct_group && !fused_dir) gather_group();
+                                const bool fused_gu = fused_dir ||
+                                                      (iq_fuse && tc_iq_gu_l && lay.native &&
+                                                       fp16tc_iq::gu_swiglu_q8_1(mmq_gt, m.grp_gu, mmq_gub, ngx, maxr, gu.bounds,
+                                                                                 m.Xq, (int64_t) (T * K), dbg_h ? m.H : nullptr,
+                                                                                 640, mmq_dt, m.Hq, m.cs));
                                 if (fused_gu) {
                                     pt.mark(kPfGemmD, cs);
                                 } else {
@@ -3055,8 +3107,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (GROUPS + 1);
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
-                                if (tc_down2_l && fp16tc_down::down(mmq_dt, m.grp_d, mmq_db, ngx, maxr, dn.bounds, m.Hq,
-                                                                    nr, m.Dm, N, r0, m.cs)) {
+                                bool down_dir = false;   // a direct group's down product from the experts' own blobs
+                                if (direct_group && !gathered) {
+                                    const auto& fd = lay.fmt[(size_t) l];
+                                    const uint8_t* dnb[MMQ_GROUP];
+                                    for (int i = 0; i < ngx; ++i) dnb[i] = gg.blob[i] + fd.down_off;
+                                    down_dir = fp16tc_down::down_blobs(mmq_dt, dnb, ngx, maxr, dn.bounds, m.Hq, nr, m.Dm, N, r0,
+                                                                       m.cs);
+                                }
+                                if (direct_group && !down_dir) gather_group();
+                                if (down_dir) {
+                                    // the whole-expert kernel took the group straight from the blobs
+                                } else if (tc_down2_l && fp16tc_down::down(mmq_dt, m.grp_d, mmq_db, ngx, maxr, dn.bounds, m.Hq,
+                                                                           nr, m.Dm, N, r0, m.cs)) {
                                     // the whole-expert kernel took the group
                                 } else if (tc_down_l && ngx <= fp16tc::kMaxBatch) {
                                     const auto& fd = lay.fmt[(size_t) l];
@@ -3070,6 +3133,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     fp16tc::down(bt, geo, dn.bounds, m.Hq, nr, m.Dm, N, r0, m.cs);
                                 } else {
                                     m.mmq_ctx->run(dn, m.cs);
+                                }
+                                if (direct_group) {   // every product that reads the blobs is queued: the held ring slots can go
+                                    if (gg_nslots > 0) {
+                                        const int rel = gg_slots[gg_nslots - 1];
+                                        cudaEventRecord(m.used[rel], m.cs);
+                                        for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                                    }
+                                    gg_nslots = 0;
+                                    gg = mmq::GatherGroup{};
                                 }
                                 return true;
                             }

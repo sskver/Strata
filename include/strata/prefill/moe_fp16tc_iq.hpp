@@ -51,6 +51,14 @@ bool gu_swiglu(int gu_type, const void* w, size_t expert_bytes, int n_experts, i
 bool gu_swiglu_q8_1(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows,
                     const int32_t* bounds, const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, int hq_type,
                     void* hq, void* stream);
+/// gu_swiglu_q8_1() on the experts' own blobs, without gathering them first: expert i's gate rows start at `blobs[i]`
+/// ([n_ff rows][K] GGUF blocks) and its up rows at `blobs[i] + n_ff * row_bytes + up_delta` (up_delta = the blob's up
+/// offset minus the gate matrix's size; 0 when the up rows follow the gate rows).  At most 16 experts; the blobs must stay
+/// valid until the launch finishes (the caller releases ring slots after it).  Same conditions and false returns as
+/// gu_swiglu_q8_1 (nothing is launched when it returns false).
+bool gu_swiglu_q8_1_blobs(int gu_type, const uint8_t* const* blobs, ptrdiff_t up_delta, int n_experts, int64_t max_rows,
+                          const int32_t* bounds, const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, int hq_type,
+                          void* hq, void* stream);
 
 #else  // !STRATA_PREFILL_FP16TC - no-ops so the caller needs no #ifdef.
 
@@ -65,6 +73,10 @@ inline bool gu_swiglu(int, const void*, size_t, int, int64_t, const int32_t*, co
 }
 inline bool gu_swiglu_q8_1(int, const void*, size_t, int, int64_t, const int32_t*, const void*, int64_t, float*, int64_t, int,
                            void*, void*) {
+    return false;
+}
+inline bool gu_swiglu_q8_1_blobs(int, const uint8_t* const*, ptrdiff_t, int, int64_t, const int32_t*, const void*, int64_t, float*,
+                                 int64_t, int, void*, void*) {
     return false;
 }
 

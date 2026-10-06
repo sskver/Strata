@@ -39,6 +39,11 @@ bool supported(int d_type, int64_t n_embd, int64_t n_ff);
 /// fp16tc::down and MMQ measured as fast or faster): the caller then uses its existing path.
 bool down(int d_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
           const void* hq, int64_t hq_rows, float* dst, int64_t ld_dst, int64_t dst_row_base, void* stream);
+/// down() on the experts' own down matrices, without gathering them first: expert i's matrix ([n_embd rows][n_ff] GGUF
+/// blocks) starts at `down_ptrs[i]` (2-byte aligned; at most 64 experts).  The matrices must stay valid until the launch
+/// finishes.  The same conditions and false returns as down() (nothing is launched when it returns false).
+bool down_blobs(int d_type, const uint8_t* const* down_ptrs, int n_experts, int64_t max_rows, const int32_t* bounds,
+                const void* hq, int64_t hq_rows, float* dst, int64_t ld_dst, int64_t dst_row_base, void* stream);
 
 #else  // !STRATA_PREFILL_FP16TC - no-ops so the caller needs no #ifdef.
 
@@ -47,6 +52,10 @@ inline bool available() { return false; }
 inline bool supported(int, int64_t, int64_t) { return false; }
 inline bool down(int, const void*, size_t, int, int64_t, const int32_t*, const void*, int64_t, float*, int64_t, int64_t,
                  void*) {
+    return false;
+}
+inline bool down_blobs(int, const uint8_t* const*, int, int64_t, const int32_t*, const void*, int64_t, float*, int64_t, int64_t,
+                       void*) {
     return false;
 }
 
