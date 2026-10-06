@@ -180,12 +180,17 @@ __device__ __forceinline__ void bar_arrive(int id, int n) { asm volatile("bar.ar
 
 struct ARaw { uint4 q; float d; };
 
+constexpr int MAXB = 16;   // experts a launch can address (the pointers travel in the kernel parameters)
+// The group's experts: expert z's gate rows start at p[z]; its up rows start `up_delta` bytes after where a contiguous
+// [gate rows][up rows] matrix would put them (0 for the gathered layout).
+struct Blobs { const uint8_t* p[MAXB]; };
+
 // Expert z = blockIdx.z owns the activation rows [bounds[z], bounds[z+1]); blockIdx.y takes 192 of them; blockIdx.x 128
 // weight rows (SW: the gate and up rows of 64 features).  The whole block leaves together when its row range is empty.
 // SW 0: gate/up into dst; 1: h into dst; 2: h into dst (when not null) and its q8_1 into hq (see gu_swiglu_q8_1).
 template <int WT, int GS, int SW>
 __global__ void __launch_bounds__(NT, 1)
-gu_kernel(const uint8_t* __restrict__ wbase, size_t expert_bytes, const int32_t* __restrict__ bounds,
+gu_kernel(const Blobs bl, ptrdiff_t up_delta, const int32_t* __restrict__ bounds,
           const void* __restrict__ act, int64_t act_rows, float* __restrict__ dst, int64_t ld_dst, uint8_t* __restrict__ hq) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
@@ -200,7 +205,7 @@ gu_kernel(const uint8_t* __restrict__ wbase, size_t expert_bytes, const int32_t*
     const int row0 = lo + (int) blockIdx.y * MCAP;
     if (row0 >= hi) return;
     const int local = (hi - row0 < MCAP) ? (hi - row0) : MCAP;
-    const uint8_t* const wb = wbase + (size_t) z * expert_bytes;
+    const uint8_t* const wb = bl.p[z];
     const int out_base = (int) blockIdx.x * (SW ? BN / 2 : BN);   // the first output column (SW: the first feature)
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     // the weight row behind local row r (SW: warp r / 32's 16 features, gate rows then up rows)
@@ -227,7 +232,9 @@ gu_kernel(const uint8_t* __restrict__ wbase, size_t expert_bytes, const int32_t*
             for (int u = 0; u < WU; ++u) {
                 const int unit = pt + u * PT, row = unit >> 1, dj = unit & 1;
                 if (unit >= 256) continue;
-                load_unit<WT>(wb + (size_t) w_row(row) * ROWB + (size_t) (k0 >> 8) * BS, ((k0 & 255) >> 5) + dj, wr[u]);
+                const int wrow = w_row(row);   // gate rows [0, FF) then up rows; the up half sits `up_delta` bytes further when it is not contiguous
+                load_unit<WT>(wb + (ptrdiff_t) wrow * ROWB + (wrow >= FF ? up_delta : 0) + (ptrdiff_t) (k0 >> 8) * BS,
+                              ((k0 & 255) >> 5) + dj, wr[u]);
             }
             const int kb = k0 >> 7;
 #pragma unroll
@@ -429,7 +436,7 @@ gu_kernel(const uint8_t* __restrict__ wbase, size_t expert_bytes, const int32_t*
 }
 
 template <int WT, int SW>
-void launch(const void* w, size_t expert_bytes, int n, int64_t max_rows, const int32_t* bounds, const void* xq,
+void launch(const Blobs& bl, ptrdiff_t up_delta, int n, int64_t max_rows, const int32_t* bounds, const void* xq,
             int64_t xq_rows, float* dst, void* hq, cudaStream_t s) {
     constexpr int GS = grid_in_smem<WT>();
     constexpr int smem = (GS ? grid_bytes(WT) : 0) + SMEM_STAGES;
@@ -445,9 +452,16 @@ void launch(const void* w, size_t expert_bytes, int n, int64_t max_rows, const i
         }
     }
     const dim3 grid(GU_ROWS / BN, (unsigned) ((max_rows + MCAP - 1) / MCAP), (unsigned) n);
-    gu_kernel<WT, GS, SW><<<grid, NT, smem, s>>>((const uint8_t*) w, expert_bytes, bounds, xq, xq_rows, dst,
+    gu_kernel<WT, GS, SW><<<grid, NT, smem, s>>>(bl, up_delta, bounds, xq, xq_rows, dst,
                                                  SW ? FF : GU_ROWS, (uint8_t*) hq);
     ck(cudaGetLastError(), "gu_kernel");
+}
+
+// the gathered layout: expert i at w + i * expert_bytes
+bool contiguous(const void* w, size_t expert_bytes, int n, Blobs& bl) {
+    if (n <= 0 || n > MAXB || !w) return false;
+    for (int i = 0; i < n; ++i) bl.p[i] = (const uint8_t*) w + (size_t) i * expert_bytes;
+    return true;
 }
 
 bool type_ok(int t) {
@@ -460,20 +474,20 @@ bool d4_type(int t) {
 }
 
 template <int SW>
-bool run(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
+bool run(int gu_type, const Blobs& bl, ptrdiff_t up_delta, int n_experts, int64_t max_rows, const int32_t* bounds,
          const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, void* hq, void* stream) {
-    if (!type_ok(gu_type) || ld_dst != (SW ? FF : GU_ROWS) || n_experts <= 0 || n_experts > 65535 || xq_rows <= 0)
+    if (!type_ok(gu_type) || ld_dst != (SW ? FF : GU_ROWS) || n_experts <= 0 || n_experts > MAXB || xq_rows <= 0)
         return false;
     if (((uintptr_t) xq | (uintptr_t) dst | (uintptr_t) hq) % 16 != 0) return false;   // 16-byte loads / stores
     if (max_rows <= 0) return true;                                    // nothing to compute
     if (max_rows > (int64_t) 65535 * MCAP) return false;               // grid.y limit
     const cudaStream_t s = (cudaStream_t) stream;
     switch (gu_type) {
-        case T_IQ2_XXS: launch<T_IQ2_XXS, SW>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
-        case T_IQ2_XS: launch<T_IQ2_XS, SW>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
-        case T_IQ2_S: launch<T_IQ2_S, SW>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
-        case T_IQ3_XXS: launch<T_IQ3_XXS, SW>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
-        default: launch<T_IQ3_S, SW>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
+        case T_IQ2_XXS: launch<T_IQ2_XXS, SW>(bl, up_delta, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
+        case T_IQ2_XS: launch<T_IQ2_XS, SW>(bl, up_delta, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
+        case T_IQ2_S: launch<T_IQ2_S, SW>(bl, up_delta, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
+        case T_IQ3_XXS: launch<T_IQ3_XXS, SW>(bl, up_delta, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
+        default: launch<T_IQ3_S, SW>(bl, up_delta, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
     }
     return true;
 }
@@ -495,20 +509,35 @@ bool supported(int gu_type, int64_t n_embd, int64_t n_ff) { return type_ok(gu_ty
 
 bool gu(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
         const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, void* stream) {
-    return run<0>(gu_type, w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, ld_dst, nullptr, stream);
+    Blobs bl;
+    if (!contiguous(w, expert_bytes, n_experts, bl)) return false;
+    return run<0>(gu_type, bl, 0, n_experts, max_rows, bounds, xq, xq_rows, dst, ld_dst, nullptr, stream);
 }
 
 bool gu_swiglu(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
                const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, void* stream) {
     if (!dst) return false;
-    return run<1>(gu_type, w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, ld_dst, nullptr, stream);
+    Blobs bl;
+    if (!contiguous(w, expert_bytes, n_experts, bl)) return false;
+    return run<1>(gu_type, bl, 0, n_experts, max_rows, bounds, xq, xq_rows, dst, ld_dst, nullptr, stream);
 }
 
 bool gu_swiglu_q8_1(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows,
                     const int32_t* bounds, const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, int hq_type,
                     void* hq, void* stream) {
     if (!hq || !d4_type(hq_type)) return false;
-    return run<2>(gu_type, w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, ld_dst, hq, stream);
+    Blobs bl;
+    if (!contiguous(w, expert_bytes, n_experts, bl)) return false;
+    return run<2>(gu_type, bl, 0, n_experts, max_rows, bounds, xq, xq_rows, dst, ld_dst, hq, stream);
+}
+
+bool gu_swiglu_q8_1_blobs(int gu_type, const uint8_t* const* blobs, ptrdiff_t up_delta, int n_experts, int64_t max_rows,
+                          const int32_t* bounds, const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, int hq_type,
+                          void* hq, void* stream) {
+    if (!blobs || n_experts <= 0 || n_experts > MAXB || !hq || !d4_type(hq_type)) return false;
+    Blobs bl;
+    for (int i = 0; i < n_experts; ++i) bl.p[i] = blobs[i];
+    return run<2>(gu_type, bl, up_delta, n_experts, max_rows, bounds, xq, xq_rows, dst, ld_dst, hq, stream);
 }
 
 }  // namespace strata::prefill::fp16tc_iq
