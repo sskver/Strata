@@ -36,6 +36,21 @@ bool supported(int gu_type, int64_t n_embd, int64_t n_ff);
 /// type, a pointer that is not 16-byte aligned, ld_dst != 2 n_ff): the caller then uses MMQ.
 bool gu(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
         const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, void* stream);
+/// gu() with the SwiGLU in its epilogue: writes H = silu(gate) * up into `dst` ([rows][n_ff], ld_dst == n_ff) instead
+/// of the gate/up product, with mmq::swiglu's formula (non-interleaved), so the result is bit-identical to gu() then
+/// mmq::swiglu(interleaved = false).  The same weights, `bounds` (absolute rows, the same rows of `dst`), activations
+/// and `max_rows` as gu().  Returns false, launching nothing, under gu()'s conditions (ld_dst != n_ff here): the caller
+/// then runs gu() (or MMQ) and mmq::swiglu.
+bool gu_swiglu(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
+               const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, void* stream);
+/// gu_swiglu() that also writes H's q8_1 into `hq`, byte-identical to mmq::quantize(H + r0 * n_ff, nullptr, hq,
+/// hq_type, n_ff, n_ff, rows) of the launch's rows (r0 = bounds[0], rows = bounds[n_experts] - r0: hq is group-local,
+/// its row 0 is the launch's first row, and the 512-padded tail blocks are written too).  `dst` may be null (no FP32
+/// H).  Returns false, launching nothing, under gu_swiglu()'s conditions, or when hq is null or not 16-byte aligned,
+/// or hq_type's MMQ q8_1 layout is not D4: the caller then quantizes H itself.
+bool gu_swiglu_q8_1(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows,
+                    const int32_t* bounds, const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, int hq_type,
+                    void* hq, void* stream);
 
 #else  // !STRATA_PREFILL_FP16TC - no-ops so the caller needs no #ifdef.
 
@@ -43,6 +58,13 @@ inline bool built() { return false; }
 inline bool available() { return false; }
 inline bool supported(int, int64_t, int64_t) { return false; }
 inline bool gu(int, const void*, size_t, int, int64_t, const int32_t*, const void*, int64_t, float*, int64_t, void*) {
+    return false;
+}
+inline bool gu_swiglu(int, const void*, size_t, int, int64_t, const int32_t*, const void*, int64_t, float*, int64_t, void*) {
+    return false;
+}
+inline bool gu_swiglu_q8_1(int, const void*, size_t, int, int64_t, const int32_t*, const void*, int64_t, float*, int64_t, int,
+                           void*, void*) {
     return false;
 }
 

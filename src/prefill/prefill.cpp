@@ -3028,12 +3028,28 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
-                                if (!(tc_iq_gu_l && fp16tc_iq::gu(mmq_gt, m.grp_gu, mmq_gub, ngx, maxr, gu.bounds, m.Xq,
-                                                                  (int64_t) (T * K), m.GU, 1280, m.cs)))
-                                    m.mmq_ctx->run(gu, m.cs);
-                                mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
-                                pt.mark(kPfGemmD, cs);
-                                mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                                // Gate/up, SwiGLU and H to q8_1 in one kernel (bit-identical to the chain below, which stays
+                                // as the fallback); the FP32 H is only written for the STRATA_DBG_NAN scan.
+                                // STRATA_PREFILL_IQ_FUSE=0 keeps the unfused chain.
+                                static const bool iq_fuse = [] {
+                                    const char* e = std::getenv("STRATA_PREFILL_IQ_FUSE");
+                                    return e == nullptr || std::atoi(e) != 0;
+                                }();
+                                static const bool dbg_h = std::getenv("STRATA_DBG_NAN") != nullptr;
+                                const bool fused_gu = iq_fuse && tc_iq_gu_l && lay.native &&
+                                                      fp16tc_iq::gu_swiglu_q8_1(mmq_gt, m.grp_gu, mmq_gub, ngx, maxr, gu.bounds,
+                                                                                m.Xq, (int64_t) (T * K), dbg_h ? m.H : nullptr,
+                                                                                640, mmq_dt, m.Hq, m.cs);
+                                if (fused_gu) {
+                                    pt.mark(kPfGemmD, cs);
+                                } else {
+                                    if (!(tc_iq_gu_l && fp16tc_iq::gu(mmq_gt, m.grp_gu, mmq_gub, ngx, maxr, gu.bounds, m.Xq,
+                                                                      (int64_t) (T * K), m.GU, 1280, m.cs)))
+                                        m.mmq_ctx->run(gu, m.cs);
+                                    mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                                    pt.mark(kPfGemmD, cs);
+                                    mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                                }
                                 mmq::Product dn;
                                 dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (GROUPS + 1);

@@ -12,6 +12,15 @@
 // halves hand stages over with named barriers (FULL 1/2, EMPTY 3/4), so decode and MMA overlap; with one block per SM
 // (about 92 KB of shared memory) this is what lets the tensor cores and the decoders work at the same time.  The
 // weights of an expert are decoded once per 192 rows instead of once per 64.
+//
+// gu_swiglu: the same kernel with the block's 128 weight rows taken as 64 features: consumer warp cq's 32 rows are the
+// gate rows of features f0 + 16 cq .. + 15 (its first 16-column fragment) and the up rows of the same features (its
+// second), so the two accumulators of a fragment pair hold gate and up of the same (row, feature) at the same element
+// index and the epilogue writes h = silu(g) * u (mmq::swiglu's expression) instead of g and u.  The MMA and the
+// accumulation order are unchanged; only the weight rows the producers fetch and the output are different.
+// gu_swiglu_q8_1 also quantizes h in the epilogue: a q8_1 scale covers 32 features, the 16 of a warp and the 16 of its
+// partner (the other column quarter of its pair), so the pair stages all its h tiles, meets at a named barrier, and each
+// lane takes the amax of its row's 32 values with quantize_mmq_q8_1's arithmetic.
 #include "strata/prefill/moe_fp16tc_iq.hpp"
 
 #include <cuda_fp16.h>
@@ -50,6 +59,8 @@ constexpr int MCAP = 192, NPW = 4;                      // rows per block, produ
 constexpr int NT = 256 + 32 * NPW, PT = 32 * NPW;       // threads per block, producer threads
 constexpr int AP = 72, WP = 72;                         // smem leading dims (halves) of the activation / weight tiles
 constexpr int SMEM_STAGES = 2 * (MCAP * AP + BN * WP) * 2;   // bytes: two stages of (192 x 72 + 128 x 72) halves
+constexpr int HQ_BLOCKS = (FF + 511) / 512 * 512 / 128;      // q8_1 blocks per row of H (mmq::quantize pads to 512)
+static_assert(8 * (MCAP / 32) * 16 * 20 * 4 <= SMEM_STAGES, "the q8_1 epilogue stages every h tile of the block");
 
 __host__ __device__ constexpr int block_bytes(int t) {
     return t == T_IQ2_XXS ? 66 : t == T_IQ2_XS ? 74 : t == T_IQ2_S ? 82 : t == T_IQ3_XXS ? 98 : 110;
@@ -170,11 +181,12 @@ __device__ __forceinline__ void bar_arrive(int id, int n) { asm volatile("bar.ar
 struct ARaw { uint4 q; float d; };
 
 // Expert z = blockIdx.z owns the activation rows [bounds[z], bounds[z+1]); blockIdx.y takes 192 of them; blockIdx.x 128
-// weight rows.  The whole block leaves together when its row range is empty.
-template <int WT, int GS>
+// weight rows (SW: the gate and up rows of 64 features).  The whole block leaves together when its row range is empty.
+// SW 0: gate/up into dst; 1: h into dst; 2: h into dst (when not null) and its q8_1 into hq (see gu_swiglu_q8_1).
+template <int WT, int GS, int SW>
 __global__ void __launch_bounds__(NT, 1)
 gu_kernel(const uint8_t* __restrict__ wbase, size_t expert_bytes, const int32_t* __restrict__ bounds,
-          const void* __restrict__ act, int64_t act_rows, float* __restrict__ dst, int64_t ld_dst) {
+          const void* __restrict__ act, int64_t act_rows, float* __restrict__ dst, int64_t ld_dst, uint8_t* __restrict__ hq) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     constexpr int BS = block_bytes(WT), ROWB = (N / 256) * BS;
@@ -189,8 +201,10 @@ gu_kernel(const uint8_t* __restrict__ wbase, size_t expert_bytes, const int32_t*
     if (row0 >= hi) return;
     const int local = (hi - row0 < MCAP) ? (hi - row0) : MCAP;
     const uint8_t* const wb = wbase + (size_t) z * expert_bytes;
-    const int out_base = (int) blockIdx.x * BN;
+    const int out_base = (int) blockIdx.x * (SW ? BN / 2 : BN);   // the first output column (SW: the first feature)
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    // the weight row behind local row r (SW: warp r / 32's 16 features, gate rows then up rows)
+    auto w_row = [&](int r) { return SW ? ((r & 16) ? FF : 0) + out_base + (r >> 5) * 16 + (r & 15) : out_base + r; };
     const uint8_t* grid;
     if constexpr (GS) {
         const uint32_t* gs = (const uint32_t*) grid_src<WT>();
@@ -213,7 +227,7 @@ gu_kernel(const uint8_t* __restrict__ wbase, size_t expert_bytes, const int32_t*
             for (int u = 0; u < WU; ++u) {
                 const int unit = pt + u * PT, row = unit >> 1, dj = unit & 1;
                 if (unit >= 256) continue;
-                load_unit<WT>(wb + (size_t) (out_base + row) * ROWB + (size_t) (k0 >> 8) * BS, ((k0 & 255) >> 5) + dj, wr[u]);
+                load_unit<WT>(wb + (size_t) w_row(row) * ROWB + (size_t) (k0 >> 8) * BS, ((k0 & 255) >> 5) + dj, wr[u]);
             }
             const int kb = k0 >> 7;
 #pragma unroll
@@ -310,11 +324,92 @@ gu_kernel(const uint8_t* __restrict__ wbase, size_t expert_bytes, const int32_t*
         if (k + 2 < NK) bar_arrive(3 + b, NT);   // EMPTY(b)
     }
     bar_sync(5, 256);   // all consumers are done reading the stage buffers: they become the epilogue staging
+    if constexpr (SW == 2) {
+        // A q8_1 scale covers 32 features: this warp's 16 and its partner's (warp ^ 1, the other column quarter of the
+        // pair).  Every fragment's h stays staged (MF tiles per warp) until the pair has staged both halves.
+        float* const st = reinterpret_cast<float*>(bufs) + warp * MF * 320;
+        const float* const pst = reinterpret_cast<const float*>(bufs) + (warp ^ 1) * MF * 320;
+#pragma unroll
+        for (int i = 0; i < MF; ++i) {
+            if (rh + 2 * i < nfr) {
+#pragma unroll
+                for (int t = 0; t < acc[i][0].num_elements; ++t) {
+                    const float g = acc[i][0].x[t], u = acc[i][1].x[t];
+                    acc[i][0].x[t] = g / (1.0f + __expf(-g)) * u;
+                }
+                wmma::store_matrix_sync(st + i * 320, acc[i][0], 20, wmma::mem_row_major);
+            }
+        }
+        bar_sync(6 + (warp >> 1), 64);   // the pair's tiles are staged
+        const int g0 = bounds[0], g_rows = bounds[gridDim.z] - g0;   // hq is group-local: row g0 is its row 0
+        const int kb = out_base >> 7, col = (out_base & 127) + cq * 16;   // the 128-value block, this warp's first column
+#pragma unroll
+        for (int i = 0; i < MF; ++i) {
+            const int f = rh + 2 * i;
+            if (f < nfr) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int idx = lane + 32 * h, r = idx >> 2, c4 = idx & 3, m = f * 16 + r;
+                    const float4 xi = *reinterpret_cast<const float4*>(st + i * 320 + r * 20 + 4 * c4);
+                    const float4 xp = *reinterpret_cast<const float4*>(pst + i * 320 + r * 20 + 4 * c4);
+                    // quantize_mmq_q8_1's arithmetic (D4 layout): the 32 values' amax (the 4 lanes of the row and the
+                    // partner's tile), d_inv = 127 / amax, the codes rounded, d = 1 / d_inv
+                    float amax = fabsf(xi.x);
+                    amax = fmaxf(amax, fabsf(xi.y));
+                    amax = fmaxf(amax, fabsf(xi.z));
+                    amax = fmaxf(amax, fabsf(xi.w));
+                    amax = fmaxf(amax, fmaxf(fmaxf(fabsf(xp.x), fabsf(xp.y)), fmaxf(fabsf(xp.z), fabsf(xp.w))));
+                    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 1));
+                    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 2));
+                    const float d_inv = 127.0f / amax;
+                    char4 q;
+                    q.x = roundf(xi.x * d_inv);
+                    q.y = roundf(xi.y * d_inv);
+                    q.z = roundf(xi.z * d_inv);
+                    q.w = roundf(xi.w * d_inv);
+                    const float d = 1.0f / d_inv;
+                    if (m < local) {
+                        if (dst) *reinterpret_cast<float4*>(dst + (int64_t) (row0 + m) * ld_dst + out_base + cq * 16 + 4 * c4) = xi;
+                        uint8_t* const blk = hq + ((size_t) kb * g_rows + (size_t) (row0 + m - g0)) * ACTB;
+                        reinterpret_cast<char4*>(blk + 16 + col)[c4] = q;
+                        if (!(cq & 1) && c4 == 0) reinterpret_cast<float*>(blk)[col >> 5] = d;
+                    }
+                }
+            }
+        }
+        if (blockIdx.x == 0) {   // the blocks past n_ff up to the 512-padded width: zero codes and scales, as quantize writes
+            constexpr int PB = HQ_BLOCKS - FF / 128, U4 = ACTB / 16;
+            for (int j = tid; j < local * PB * U4; j += 256) {
+                const int m = j / (PB * U4), b = (j / U4) % PB;
+                reinterpret_cast<uint4*>(hq + ((size_t) (FF / 128 + b) * g_rows + (size_t) (row0 + m - g0)) * ACTB)[j % U4] =
+                    make_uint4(0, 0, 0, 0);
+            }
+        }
+        return;
+    }
     float* stg = reinterpret_cast<float*>(bufs) + warp * 16 * 20;
 #pragma unroll
     for (int i = 0; i < MF; ++i) {
         const int f = rh + 2 * i;
-        if (f < nfr) {
+        if constexpr (SW) {   // the fragment pair is (gate, up) of the same elements: h in place of the gate, one tile out
+            if (f < nfr) {
+#pragma unroll
+                for (int t = 0; t < acc[i][0].num_elements; ++t) {
+                    const float g = acc[i][0].x[t], u = acc[i][1].x[t];
+                    acc[i][0].x[t] = g / (1.0f + __expf(-g)) * u;
+                }
+                wmma::store_matrix_sync(stg, acc[i][0], 20, wmma::mem_row_major);
+                __syncwarp();
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int idx = lane + 32 * h, r = idx >> 2, c4 = idx & 3, m = f * 16 + r;
+                    if (m < local)
+                        *reinterpret_cast<float4*>(dst + (int64_t) (row0 + m) * ld_dst + out_base + cq * 16 + 4 * c4) =
+                            *reinterpret_cast<const float4*>(stg + r * 20 + 4 * c4);
+                }
+                __syncwarp();
+            }
+        } else if (f < nfr) {
 #pragma unroll
             for (int c = 0; c < 2; ++c) {
                 wmma::store_matrix_sync(stg, acc[i][c], 20, wmma::mem_row_major);
@@ -333,9 +428,9 @@ gu_kernel(const uint8_t* __restrict__ wbase, size_t expert_bytes, const int32_t*
 #endif
 }
 
-template <int WT>
+template <int WT, int SW>
 void launch(const void* w, size_t expert_bytes, int n, int64_t max_rows, const int32_t* bounds, const void* xq,
-            int64_t xq_rows, float* dst, cudaStream_t s) {
+            int64_t xq_rows, float* dst, void* hq, cudaStream_t s) {
     constexpr int GS = grid_in_smem<WT>();
     constexpr int smem = (GS ? grid_bytes(WT) : 0) + SMEM_STAGES;
     {   // the per-device opt-in to more than 48 KB of dynamic shared memory
@@ -345,17 +440,42 @@ void launch(const void* w, size_t expert_bytes, int n, int64_t max_rows, const i
         ck(cudaGetDevice(&dev), "cudaGetDevice");
         std::lock_guard<std::mutex> lk(mu);
         if (dev >= 0 && dev < 16 && !done[dev]) {
-            ck(cudaFuncSetAttribute(gu_kernel<WT, GS>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "smem attribute");
+            ck(cudaFuncSetAttribute(gu_kernel<WT, GS, SW>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "smem attribute");
             done[dev] = true;
         }
     }
     const dim3 grid(GU_ROWS / BN, (unsigned) ((max_rows + MCAP - 1) / MCAP), (unsigned) n);
-    gu_kernel<WT, GS><<<grid, NT, smem, s>>>((const uint8_t*) w, expert_bytes, bounds, xq, xq_rows, dst, GU_ROWS);
+    gu_kernel<WT, GS, SW><<<grid, NT, smem, s>>>((const uint8_t*) w, expert_bytes, bounds, xq, xq_rows, dst,
+                                                 SW ? FF : GU_ROWS, (uint8_t*) hq);
     ck(cudaGetLastError(), "gu_kernel");
 }
 
 bool type_ok(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S;
+}
+// the down types whose q8_1 activations MMQ reads in the D4 layout (mmq_get_q8_1_ds_layout; 42 is Strata's Q2_0)
+bool d4_type(int t) {
+    return t == 42 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q3_K || t == GGML_TYPE_Q6_K || type_ok(t) ||
+           t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_IQ4_XS;
+}
+
+template <int SW>
+bool run(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
+         const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, void* hq, void* stream) {
+    if (!type_ok(gu_type) || ld_dst != (SW ? FF : GU_ROWS) || n_experts <= 0 || n_experts > 65535 || xq_rows <= 0)
+        return false;
+    if (((uintptr_t) xq | (uintptr_t) dst | (uintptr_t) hq) % 16 != 0) return false;   // 16-byte loads / stores
+    if (max_rows <= 0) return true;                                    // nothing to compute
+    if (max_rows > (int64_t) 65535 * MCAP) return false;               // grid.y limit
+    const cudaStream_t s = (cudaStream_t) stream;
+    switch (gu_type) {
+        case T_IQ2_XXS: launch<T_IQ2_XXS, SW>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
+        case T_IQ2_XS: launch<T_IQ2_XS, SW>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
+        case T_IQ2_S: launch<T_IQ2_S, SW>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
+        case T_IQ3_XXS: launch<T_IQ3_XXS, SW>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
+        default: launch<T_IQ3_S, SW>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, hq, s); break;
+    }
+    return true;
 }
 
 }  // namespace
@@ -375,19 +495,20 @@ bool supported(int gu_type, int64_t n_embd, int64_t n_ff) { return type_ok(gu_ty
 
 bool gu(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
         const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, void* stream) {
-    if (!type_ok(gu_type) || ld_dst != GU_ROWS || n_experts <= 0 || n_experts > 65535 || xq_rows <= 0) return false;
-    if (((uintptr_t) xq | (uintptr_t) dst) % 16 != 0) return false;   // the kernel's 16-byte activation loads / output stores
-    if (max_rows <= 0) return true;                                    // nothing to compute
-    if (max_rows > (int64_t) 65535 * MCAP) return false;               // grid.y limit
-    const cudaStream_t s = (cudaStream_t) stream;
-    switch (gu_type) {
-        case T_IQ2_XXS: launch<T_IQ2_XXS>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, s); break;
-        case T_IQ2_XS: launch<T_IQ2_XS>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, s); break;
-        case T_IQ2_S: launch<T_IQ2_S>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, s); break;
-        case T_IQ3_XXS: launch<T_IQ3_XXS>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, s); break;
-        default: launch<T_IQ3_S>(w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, s); break;
-    }
-    return true;
+    return run<0>(gu_type, w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, ld_dst, nullptr, stream);
+}
+
+bool gu_swiglu(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows, const int32_t* bounds,
+               const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, void* stream) {
+    if (!dst) return false;
+    return run<1>(gu_type, w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, ld_dst, nullptr, stream);
+}
+
+bool gu_swiglu_q8_1(int gu_type, const void* w, size_t expert_bytes, int n_experts, int64_t max_rows,
+                    const int32_t* bounds, const void* xq, int64_t xq_rows, float* dst, int64_t ld_dst, int hq_type,
+                    void* hq, void* stream) {
+    if (!hq || !d4_type(hq_type)) return false;
+    return run<2>(gu_type, w, expert_bytes, n_experts, max_rows, bounds, xq, xq_rows, dst, ld_dst, hq, stream);
 }
 
 }  // namespace strata::prefill::fp16tc_iq
