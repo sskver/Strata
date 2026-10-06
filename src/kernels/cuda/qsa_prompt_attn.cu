@@ -1117,10 +1117,467 @@ bool launch70(const float* q, const QsaAttnPools& pools, const int32_t* ids, con
     }
     return true;
 }
+
+// ---- sm_70, pipelined (modes 0 and 1) ----------------------------------------------------------------------------
+// prompt_attn_v70_kernel's arithmetic in the same order - the output is bitwise equal to it - restructured for a V100,
+// where the v70 kernel spent its time waiting: a chunk's gather and its MMAs were serialized (measured at 32K, int8:
+// 5.1 ms of 13.8 in the gather, 6.5 in the MMA phases, little overlap) at 2 blocks (8 warps) per SM. Here:
+//   * the next chunk's K/V rows and scales are loaded into registers while this chunk computes and stored to shared
+//     memory at the top of the next one (Volta has no cp.async); the row ids are read two chunks ahead and the page
+//     table one chunk ahead of use, so no load is waited on in the chunk that issues it;
+//   * row block 1 holds heads 8..11 only, so its 4 pad rows carry the lo halves of those heads (A rows 0-3 = hi, 4-7
+//     = lo): one m8n8k4 instead of two for q.k and for p.v, the same products in the same chains; the lo results
+//     (C rows 4-7, lanes 16-31) come back to the hi lanes with one shuffle per register. 96 MMAs per warp and chunk
+//     instead of 128, and no pad rows in shared memory;
+//   * K is staged (coalesced 16-byte pieces, cell bit 3 swizzling the piece) in the bytes the q.k partials use later:
+//     each thread reads its own B operand (cell qp*8+jj, its warp's 64 dims) to registers before a barrier;
+//   * V is stored transposed by cell quads (one 32-bit word = 4 cells' int8 codes of one dim, fp16: 8 bytes), so a
+//     p.v B operand is one shared load instead of four byte loads; int8 codes become exact half2 with one XOR per
+//     four codes and a byte permute per pair;
+//   * the softmax writes e only; each warp builds p * (V scale * vup) as hi + lo halves for its own scale group at
+//     the start of its p.v, in place over its group's partials (the v70 kernel built them in every quad-pair);
+//   * 31.8 KB of shared memory and <= 168 registers in mode 1: 3 blocks (12 warps) per SM. FP16 KV: 2 blocks.
+// Measured (V100-PCIE, CUDA 12.9, qsa_prompt_attn_parity's shapes, 2048 queries): int8 32K 14.0 -> 6.6 ms, 131K
+// 13.9 -> 6.5 ms; FP16 32K 29.3 -> 8.8 ms; bitwise equal output. STRATA_PROMPT_ATTN_V70_OLD=1: the v70 kernel (A/B).
+template <int KV_MODE>
+struct Smem70p {
+    using KElem = typename std::conditional<KV_MODE == 0, __half, int8_t>::type;
+    static constexpr int KROW = KV_MODE == 0 ? HD + 8 : HD + 16;     // staged K row, elements (16-byte pieces)
+    static constexpr int VW = KV_MODE == 0 ? 2 : 1;                  // 32-bit words per (cell quad, dim)
+    static constexpr int PBYTES = 4 * G * (CH + 4) * 4;              // q.k partials, float [4][G][CH + 4]
+    static constexpr int EBYTES = G * (CH + 4) * 4;                  // the chunk's e, float [G][CH + 4]
+    static constexpr int KBYTES = CH * KROW * (int) sizeof(KElem);   // the staged K rows
+    __half qh[G][QS];
+    __half ql[G][QS];
+    uint32_t v[CH / 4][HD * VW];   // [cell quad][swizzled dim]: 4 cells of one dim
+    float ks[CH][4];
+    float vs[CH][4];
+    // the staged K rows [CH][KROW]; once they are in registers, the q.k partials per dim group, which become (in
+    // place) p hi (4 halves) + lo (4 halves) per 4 cells, and behind them the chunk's e
+    alignas(16) unsigned char pk[KBYTES > PBYTES + EBYTES ? KBYTES : PBYTES + EBYTES];
+    float w[4][CH];                // the V scale times vup, per group and cell
+    float vdown[4];
+    float qmax[THREADS / 32];
+    float alpha[G];
+    float lsum[G];
+    float mrow[G];
+    long long row[2][CH];          // the next two chunks' rows
+};
+
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+// V word positions: int8 - XOR bits 2-3 of the dim with bits 5-6 (a quad-pair's loads stay 32 consecutive words, the
+// transposing 16-byte stores of 8 consecutive pieces land on 8 distinct bank quads); fp16 (8-byte entries) - bit 2
+// with bit 4
+__device__ __forceinline__ int vsw8(int d) { return d ^ (((d >> 5) & 3) << 2); }
+__device__ __forceinline__ int vsw16(int d) { return d ^ (((d >> 4) & 1) << 2); }
+// Four int8 codes (one word, low byte first) as two exact half2 (codes 0,1 and 2,3): i8x2_to_h2's construction with
+// one XOR for all four and a byte permute per pair
+__device__ __forceinline__ void i8x4_to_h2x2(uint32_t x, uint32_t& lo, uint32_t& hi) {
+    const uint32_t u = x ^ 0x80808080u;
+    uint32_t a = prmt(u, 0x64646464u, 0x4140), b = prmt(u, 0x64646464u, 0x4342);
+    const __half2 k = __halves2half2(__float2half(1152.f), __float2half(1152.f));
+    __half2 ha = __hsub2(*reinterpret_cast<__half2*>(&a), k), hb = __hsub2(*reinterpret_cast<__half2*>(&b), k);
+    lo = *reinterpret_cast<uint32_t*>(&ha);
+    hi = *reinterpret_cast<uint32_t*>(&hb);
+}
+// p (4 cells) as hi halves (.x, .y) and lo halves (.z, .w), as the v70 kernel splits it
+__device__ __forceinline__ uint4 split_p4(const float* pv) {
+    uint4 o;
+    o.x = pack_h2(pv[0], pv[1]);
+    o.y = pack_h2(pv[2], pv[3]);
+    const float2 f01 = __half22float2(*reinterpret_cast<const __half2*>(&o.x));
+    const float2 f23 = __half22float2(*reinterpret_cast<const __half2*>(&o.y));
+    o.z = pack_h2(pv[0] - f01.x, pv[1] - f01.y);
+    o.w = pack_h2(pv[2] - f23.x, pv[3] - f23.y);
+    return o;
+}
+
+template <int KV_MODE>
+__global__ void __launch_bounds__(THREADS, KV_MODE == 1 ? 3 : 1)
+    prompt_attn_v70p_kernel(const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids,
+                            const int32_t* __restrict__ steps, int n_kv_heads, int page_size, float scale_log2,
+                            float* __restrict__ attn, int cap) {
+    static_assert(KV_MODE == 0 || KV_MODE == 1, "int8 or fp16 K and V");
+    static_assert(CH == 32 && G == 12 && THREADS == 128, "the loader, the packing and the softmax assume these");
+    using SM = Smem70p<KV_MODE>;
+    using KElem = typename SM::KElem;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    SM& S = *reinterpret_cast<SM*>(smem_raw);
+    float (*part)[G][CH + 4] = reinterpret_cast<float (*)[G][CH + 4]>(S.pk);
+    float (*eb)[CH + 4] = reinterpret_cast<float (*)[CH + 4]>(S.pk + SM::PBYTES);
+    KElem (*kst)[SM::KROW] = reinterpret_cast<KElem (*)[SM::KROW]>(S.pk);
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * G;
+    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    ids += (size_t) qi * cap;
+    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int qp = (lane >> 2) & 3, jj = (lane & 3) + 4 * (lane >> 4);   // quad-pair, thread within it
+    const int crow = (lane & 1) + 4 * (lane >> 4);                        // C row of register 0 (+2 per register pair)
+    const int ccol = lane & 2;                                           // C column of register 0 (+4 per half, +1 per reg)
+
+    // a chunk's rows, resolved now (the first two chunks)
+    auto rows_of = [&](int buf, int c0) {
+        if (t < CH) {
+            long long r = -1;
+            if (c0 + t < n) {
+                const int cell = ids[c0 + t];
+                r = ((long long) p.page_table[cell / page_size] * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
+            S.row[buf][t] = r;
+        }
+    };
+    // q as the v70 kernel scales and splits it (12 heads, no pad rows)
+    float qm = 0.0f;
+    for (int i = t; i < G * HD; i += THREADS) qm = fmaxf(qm, fabsf(q[i]));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, o));
+    if (lane == 0) S.qmax[warp] = qm;
+    rows_of(0, 0);
+    __syncthreads();
+    qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
+    int qe = 0;
+    if (qm > 0.0f) frexpf(qm, &qe);                 // qm < 2^qe
+    const float qup = ldexpf(1.0f, 14 - qe), qdown = ldexpf(scale_log2, qe - 14);
+    for (int i = t; i < G * HD; i += THREADS) {
+        const int h = i / HD, d = i % HD;
+        const float x = q[(size_t) h * HD + d] * qup;
+        const __half hi = __float2half_rn(x);
+        S.qh[h][d] = hi;
+        S.ql[h][d] = __float2half_rn(x - __half2float(hi));
+    }
+    if (t < G) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
+
+    // the register stage: item (i, e) = cell 4 * quad + e, 16-byte piece pc of its K and V rows; scales: cell t / 4,
+    // group t % 4
+    constexpr int KP = HD * (int) sizeof(KElem) / 16;   // 16-byte pieces per row (int8 16, fp16 32)
+    constexpr int VI = (CH / 4) * KP / THREADS;         // (cell quad, piece) items per thread (int8 1, fp16 2)
+    constexpr int DPP = 16 / (int) sizeof(KElem);       // dims per piece
+    constexpr int KF = 64 / DPP;                        // pieces of a q.k B operand (one cell, 64 dims)
+    constexpr long long RB = HD * (long long) sizeof(KElem);   // row bytes
+    uint4 kx[VI][4], vx[VI][4];
+    unsigned short ksr = 0, vsr = 0;
+    bool sok = false;
+    const unsigned char* kbase = KV_MODE == 0 ? reinterpret_cast<const unsigned char*>(p.k_pool)
+                                              : reinterpret_cast<const unsigned char*>(p.k_q);
+    const unsigned char* vbase = KV_MODE == 0 ? reinterpret_cast<const unsigned char*>(p.v_pool)
+                                              : reinterpret_cast<const unsigned char*>(p.v_q);
+    auto issue = [&](int buf) {
+#pragma unroll
+        for (int i = 0; i < VI; ++i) {
+            const int it = i * THREADS + t, qd = it / KP, pc = it % KP;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const long long r = S.row[buf][4 * qd + e];
+                kx[i][e] = vx[i][e] = make_uint4(0, 0, 0, 0);
+                if (r >= 0) {
+                    const long long off = r * RB + pc * 16;
+                    kx[i][e] = __ldg(reinterpret_cast<const uint4*>(kbase + off));
+                    vx[i][e] = __ldg(reinterpret_cast<const uint4*>(vbase + off));
+                }
+            }
+        }
+        const long long r = S.row[buf][t >> 2];
+        sok = r >= 0;
+        if constexpr (KV_MODE == 1) {
+            if (sok) {
+                ksr = __ldg(p.k_scale + r * (HD / KV_Q8_GROUP) + (t & 3));
+                vsr = __ldg(p.v_scale + r * (HD / KV_Q8_GROUP) + (t & 3));
+            }
+        }
+    };
+    auto store = [&]() {   // the staged K rows, V transposed by cell quads, the scales
+#pragma unroll
+        for (int i = 0; i < VI; ++i) {
+            const int it = i * THREADS + t, qd = it / KP, pc = it % KP;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int c = 4 * qd + e;
+                *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(&kst[c][0]) +
+                                          (pc ^ (((c >> 3) & 1) << 2)) * 16) = kx[i][e];
+            }
+            const uint32_t w0[4] = {vx[i][0].x, vx[i][0].y, vx[i][0].z, vx[i][0].w};
+            const uint32_t w1[4] = {vx[i][1].x, vx[i][1].y, vx[i][1].z, vx[i][1].w};
+            const uint32_t w2[4] = {vx[i][2].x, vx[i][2].y, vx[i][2].z, vx[i][2].w};
+            const uint32_t w3[4] = {vx[i][3].x, vx[i][3].y, vx[i][3].z, vx[i][3].w};
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                if constexpr (KV_MODE == 1) {   // 4 cells x 4 dims of int8 -> 4 dims x 4 cells
+                    const uint32_t t0 = prmt(w0[m], w1[m], 0x5140), t1 = prmt(w0[m], w1[m], 0x7362);
+                    const uint32_t t2 = prmt(w2[m], w3[m], 0x5140), t3 = prmt(w2[m], w3[m], 0x7362);
+                    const uint4 o = make_uint4(prmt(t0, t2, 0x5410), prmt(t0, t2, 0x7632), prmt(t1, t3, 0x5410),
+                                               prmt(t1, t3, 0x7632));
+                    *reinterpret_cast<uint4*>(&S.v[qd][vsw8(pc * 16 + 4 * m)]) = o;
+                } else {   // 4 cells x 2 dims of fp16 -> 2 dims x 4 cells
+                    const uint4 o = make_uint4(prmt(w0[m], w1[m], 0x5410), prmt(w2[m], w3[m], 0x5410),
+                                               prmt(w0[m], w1[m], 0x7632), prmt(w2[m], w3[m], 0x7632));
+                    *reinterpret_cast<uint4*>(&S.v[qd][2 * vsw16(pc * 8 + 2 * m)]) = o;
+                }
+            }
+        }
+        const float one = sok ? 1.0f : 0.0f;
+        S.ks[t >> 2][t & 3] = KV_MODE == 1 ? (sok ? __half2float(__ushort_as_half(ksr)) : 0.0f) : one;
+        S.vs[t >> 2][t & 3] = KV_MODE == 1 ? (sok ? __half2float(__ushort_as_half(vsr)) : 0.0f) : one;
+    };
+    // the later chunks' rows: the id two chunks ahead and the page one chunk ahead of the row written (cell -1: past
+    // the selection)
+    auto cell_at = [&](int c0) { return c0 + t < n ? __ldg(ids + c0 + t) : -1; };
+    auto page_of = [&](int cell) { return cell >= 0 ? __ldg(p.page_table + cell / page_size) : 0; };
+    issue(0);
+    rows_of(1, CH);
+    int cell2 = -1, cell3 = -1, page2 = 0;
+    if (t < CH) {
+        cell2 = cell_at(2 * CH);
+        cell3 = cell_at(3 * CH);
+        page2 = page_of(cell2);
+    }
+
+    float acc[2][2][8];   // [row block][n-tile]; row block 1: lanes 0-15 only (heads 8..11)
+#pragma unroll
+    for (int rb = 0; rb < 2; ++rb)
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[rb][nt][i] = 0.0f;
+
+    const int nchunks = (n + CH - 1) / CH;
+    for (int ci = 0; ci < nchunks; ++ci) {
+        const int nh = min(CH, n - ci * CH);
+        __syncthreads();   // the previous chunk's p.v is done with v, vs and pk
+        store();
+        __syncthreads();
+        if (ci + 1 < nchunks) issue((ci + 1) & 1);   // in flight through this chunk's MMAs
+        if (t < CH && ci + 2 < nchunks) {
+            S.row[ci & 1][t] =
+                cell2 >= 0 ? ((long long) page2 * n_kv_heads + kvh) * page_size + (cell2 % page_size) : -1LL;
+            cell2 = cell3;
+            page2 = page_of(cell3);
+            cell3 = cell_at((ci + 4) * CH);
+        }
+        // scores: warp w = dim group w, QP q = cells 8q..8q+7; the hi and lo halves of q accumulate in separate
+        // m8n8k4 chains (tg[0] / tgl: heads 0..7; tg[1]: heads 8..11 hi in C rows 0-3, lo in rows 4-7), added in
+        // FP32 at the end (see prompt_attn_v70_kernel)
+        {
+            float tg[2][8], tgl[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) tg[0][i] = tg[1][i] = tgl[i] = 0.0f;
+            const int cell_b = qp * 8 + jj;
+            const unsigned char* krow = reinterpret_cast<const unsigned char*>(&kst[cell_b][0]);
+            const int sw = ((cell_b >> 3) & 1) << 2;
+            uint4 kf[KF];
+#pragma unroll
+            for (int pp = 0; pp < KF; ++pp)
+                kf[pp] = *reinterpret_cast<const uint4*>(krow + ((warp * KF + pp) ^ sw) * 16);
+            __syncthreads();   // pk holds the partials from here
+            const __half* a1row = jj < 4 ? &S.qh[8 + jj][0] : &S.ql[jj + 4][0];
+#pragma unroll
+            for (int pp = 0; pp < KF; ++pp) {
+                const uint32_t w[4] = {kf[pp].x, kf[pp].y, kf[pp].z, kf[pp].w};
+#pragma unroll
+                for (int m = 0; m < DPP / 4; ++m) {
+                    const int d0 = warp * 64 + (pp * (DPP / 4) + m) * 4;
+                    uint32_t b0, b1;
+                    if constexpr (KV_MODE == 1) {   // INT8 codes, exact in FP16
+                        i8x4_to_h2x2(w[m], b0, b1);
+                    } else {
+                        b0 = w[2 * m];
+                        b1 = w[2 * m + 1];
+                    }
+                    const uint2 ah = *reinterpret_cast<const uint2*>(&S.qh[jj][d0]);
+                    const uint2 al = *reinterpret_cast<const uint2*>(&S.ql[jj][d0]);
+                    const uint2 a1 = *reinterpret_cast<const uint2*>(a1row + d0);
+                    mma884(tg[0], ah.x, ah.y, b0, b1);
+                    mma884(tgl, al.x, al.y, b0, b1);
+                    mma884(tg[1], a1.x, a1.y, b0, b1);
+                }
+            }
+            float lo1[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) lo1[i] = __shfl_xor_sync(0xffffffffu, tg[1][i], 16);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = crow + 2 * ((i >> 1) & 1);
+                const int cell = qp * 8 + ccol + 4 * (i >> 2) + (i & 1);
+                const float kscale = S.ks[cell][warp];
+                part[warp][row][cell] = (tg[0][i] + tgl[i]) * kscale;
+                if (lane < 16) part[warp][8 + row][cell] = (tg[1][i] + lo1[i]) * kscale;
+            }
+            // the V scale of group `warp`, relative to the chunk's largest, times 2^14 (as v70)
+            float vmax = 0.0f;
+#pragma unroll
+            for (int c = lane; c < CH; c += 32) vmax = fmaxf(vmax, S.vs[c][warp]);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+            const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f;
+            S.w[warp][lane] = S.vs[lane][warp] * vup;
+            if (lane == 0) S.vdown[warp] = vmax * (1.0f / 16384.0f);
+        }
+        __syncthreads();
+        // online softmax: row t/8 (warps 0-2), 4 cells per thread, 8 threads per row; e to eb
+        if (warp < 3) {
+            constexpr int PER = CH / 8;
+            const int r = t >> 3, sub = t & 7;
+            float x[PER], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const int c = sub * PER + j;
+                const float sum4 = ((part[0][r][c] + part[1][r][c]) + part[2][r][c]) + part[3][r][c];
+                x[j] = c < nh ? sum4 * qdown : -INFINITY;
+                mx = fmaxf(mx, x[j]);
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                x[j] = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                sum += x[j];
+            }
+            *reinterpret_cast<float4*>(&eb[r][sub * PER]) = make_float4(x[0], x[1], x[2], x[3]);
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            if (sub == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[r] = a;
+                S.lsum[r] = fmaf(S.lsum[r], a, sum);
+                S.mrow[r] = m_new;
+            }
+        }
+        __syncthreads();
+        // p.v: warp w owns dims [64w, 64w+64) (int8 scale group w), QP q dims 64w + 32nt + 8q + (0..7) of n-tile nt;
+        // the V scale is folded into p relative to the chunk's largest, times 2^14 (as v70)
+        {
+            {   // this warp's group: p = e * (V scale * vup) as hi + lo halves over its partials, 4 cells per lane
+                const int c4 = (lane & 7) * 4;
+                const float4 w4 = *reinterpret_cast<const float4*>(&S.w[warp][c4]);
+#pragma unroll
+                for (int it = 0; it < G / 4; ++it) {
+                    const int r = it * 4 + (lane >> 3);
+                    const float4 e4 = *reinterpret_cast<const float4*>(&eb[r][c4]);
+                    const float pv[4] = {e4.x * w4.x, e4.y * w4.y, e4.z * w4.z, e4.w * w4.w};
+                    *reinterpret_cast<uint4*>(&part[warp][r][c4]) = split_p4(pv);
+                }
+                __syncwarp();
+            }
+            float tmp[2][8], tmpl[2][8], tmp1[2][8];   // [n-tile]: heads 0..7 hi, lo; heads 8..11 hi (rows 0-3) + lo
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) tmp[nt][i] = tmpl[nt][i] = tmp1[nt][i] = 0.0f;
+            const float* p1row = &part[warp][8 + (jj & 3)][jj < 4 ? 0 : 2];
+#pragma unroll
+            for (int ks = 0; ks < CH / 4; ++ks) {
+                const uint4 pa = *reinterpret_cast<const uint4*>(&part[warp][jj][ks * 4]);
+                const uint2 a1 = *reinterpret_cast<const uint2*>(p1row + ks * 4);
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    const int d = warp * 64 + nt * 32 + qp * 8 + jj;
+                    uint32_t b0, b1;
+                    if constexpr (KV_MODE == 1) {
+                        i8x4_to_h2x2(S.v[ks][vsw8(d)], b0, b1);
+                    } else {
+                        const uint2 raw = *reinterpret_cast<const uint2*>(&S.v[ks][2 * vsw16(d)]);
+                        b0 = raw.x;
+                        b1 = raw.y;
+                    }
+                    mma884(tmp[nt], pa.x, pa.y, b0, b1);
+                    mma884(tmpl[nt], pa.z, pa.w, b0, b1);
+                    mma884(tmp1[nt], a1.x, a1.y, b0, b1);
+                }
+            }
+            float lo1[2][8];
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) lo1[nt][i] = __shfl_xor_sync(0xffffffffu, tmp1[nt][i], 16);
+            const float vdown = S.vdown[warp];
+            {
+                const float a0 = S.alpha[crow], a2 = S.alpha[crow + 2];
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i)
+                        acc[0][nt][i] = fmaf(acc[0][nt][i], (i >> 1) & 1 ? a2 : a0, (tmp[nt][i] + tmpl[nt][i]) * vdown);
+            }
+            if (lane < 16) {   // C rows 4-7 of block 1 are the lo halves
+                const float a0 = S.alpha[8 + crow], a2 = S.alpha[8 + crow + 2];
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i)
+                        acc[1][nt][i] = fmaf(acc[1][nt][i], (i >> 1) & 1 ? a2 : a0, (tmp1[nt][i] + lo1[nt][i]) * vdown);
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int rb = 0; rb < 2; ++rb)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = rb * 8 + crow + 2 * h;
+            if (row >= G) continue;
+            const float l = S.lsum[row];
+            const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh) {
+                    const int i = hh * 4 + h * 2;               // registers i, i+1: row h, columns ccol + 4 * hh + {0, 1}
+                    const int d = warp * 64 + nt * 32 + qp * 8 + ccol + 4 * hh;
+                    *reinterpret_cast<float2*>(attn + (size_t) row * HD + d) =
+                        make_float2(acc[rb][nt][i] * inv, acc[rb][nt][i + 1] * inv);
+                }
+        }
+}
+
+template <int KV_MODE>
+bool launch70p(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+               const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+    static bool attr[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const int bytes = (int) sizeof(Smem70p<KV_MODE>);
+    if (dev < 0 || dev >= 64) return false;
+    if (!attr[dev]) {   // the carveout: all of the 96 KB for shared memory (mode 1: 3 blocks per SM)
+        if (cudaFuncSetAttribute(prompt_attn_v70p_kernel<KV_MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+                cudaSuccess ||
+            cudaFuncSetAttribute(prompt_attn_v70p_kernel<KV_MODE>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 (int) cudaSharedmemCarveoutMaxShared) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        attr[dev] = true;
+    }
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        prompt_attn_v70p_kernel<KV_MODE><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, bytes, st>>>(
+            q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch (sm_70, pipelined): %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
 #else   // AMD: no m8n8k4 kernel; the caller keeps the old one
 template <int KV_MODE>
 bool launch70(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&, float*,
               int64_t, cudaStream_t) {
+    return false;
+}
+template <int KV_MODE>
+bool launch70p(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&, float*,
+               int64_t, cudaStream_t) {
     return false;
 }
 #endif  // !__HIPCC__
@@ -1451,6 +1908,9 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
     cudaStream_t st = (cudaStream_t) stream;
+    // sm_70, int8 and FP16 KV: the pipelined kernel (launch70p, bitwise equal to launch70's).
+    // STRATA_PROMPT_ATTN_V70_OLD=1: the PR #600 kernel (A/B); K8V4 always takes it
+    static const bool v70_old = std::getenv("STRATA_PROMPT_ATTN_V70_OLD") != nullptr;
     if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4.  STRATA_PROMPT_ATTN_Q4=0: the old kernel (A/B)
         static const bool q4_off = [] {
             const char* v = std::getenv("STRATA_PROMPT_ATTN_Q4");
@@ -1471,11 +1931,13 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         // for how far the model amplifies an FP32-level change.  Turing always takes it: v2's cp.async does not
         // exist before sm_80.
         static const bool v1 = std::getenv("STRATA_PROMPT_ATTN_V1") != nullptr;
+        if (volta && !v70_old) return launch70p<1>(q, pools, ids, steps, cap, s, attn, n_q, st);
         if (volta) return launch70<1>(q, pools, ids, steps, cap, s, attn, n_q, st);
         if (v1 || turing) return launch<1>(q, pools, ids, steps, cap, s, attn, n_q, st);
         return launch_i8(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (!pools.k_pool || !pools.v_pool) return false;
+    if (volta && !v70_old) return launch70p<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
     if (volta) return launch70<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
     return launch<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
 }
