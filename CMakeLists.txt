@@ -1136,6 +1136,11 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 # weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
 # with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
+# ggml-cpu (the CPU experts' single-token dot products and activation quantizers) for AVX2 + FMA + F16C + BMI2 (x86-64-v3,
+# Haswell / Zen and newer) rather than GGML_NATIVE: -march=native is what GGML_NATIVE passes, and nix's compiler wrapper
+# drops it (NIX_ENFORCE_NO_NATIVE), which silently left ggml-cpu at the x86-64 baseline (its generic C i-quant dots,
+# ~5x slower).  -DSTRATA_CPU_AVX2=OFF: GGML_NATIVE as before (e.g. an AVX-512 host building without nix).
+option(STRATA_CPU_AVX2 "x86: build ggml-cpu for AVX2+FMA+F16C+BMI2 instead of -march=native" ON)
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
@@ -1171,6 +1176,16 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     foreach(_f GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2 GGML_AVX_VNNI GGML_AVX512 GGML_AVX512_VBMI GGML_AVX512_VNNI
                GGML_AVX512_BF16 GGML_AMX_TILE GGML_AMX_INT8 GGML_AMX_BF16)
+      set(${_f} OFF CACHE BOOL "" FORCE)
+    endforeach()
+  elseif(STRATA_CPU_AVX2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
+    foreach(_f GGML_SSE42 GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
+      set(${_f} ON CACHE BOOL "" FORCE)
+    endforeach()
+    foreach(_f GGML_AVX_VNNI GGML_AVX512 GGML_AVX512_VBMI GGML_AVX512_VNNI GGML_AVX512_BF16 GGML_AMX_TILE GGML_AMX_INT8
+               GGML_AMX_BF16)
       set(${_f} OFF CACHE BOOL "" FORCE)
     endforeach()
   else()
