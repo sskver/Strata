@@ -22,6 +22,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/dense_pk.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
@@ -849,6 +850,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                // dense_pk: attn_gate reads the same xq_ as attn_qkv, and nothing between here and its old place below (conv,
+                // gdn_ab) reads or writes xq_ or z_, so when both fit one fused launch it runs here (STRATA_PK_FUSE=0: old order)
+                const MmvqMat gdn_mats[2] = {{wqkv->native_type, wqkv->native_data, qkv + (size_t) tb * C, (int) C},
+                                             {wg->native_type, wg->native_data, z_ + (size_t) tb * ZV, (int) ZV}};
+                const bool gdn_fused = dense_pk_fused_supported(gdn_mats, 2, (int) N, n);
+                if (gdn_fused) native_mmvq_fused(gdn_mats, 2, xq_, (int) N, n, cs);
+                else
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
@@ -870,6 +878,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
+                if (!gdn_fused)
                 native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
                 stamp(l, 5, grp);
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
@@ -926,8 +935,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
                 stamp(l, 7, grp);
-                native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
-                native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                // dense_pk: attn_q reads the same xq_ as attn_k / attn_v (nothing re-quantizes it before attn_output) and
+                // nothing reads qfull_ before its old place below, so q, k, v run as one launch here when supported
+                const MmvqMat qsa_mats[3] = {{wq->native_type, wq->native_data, qfull_ + tb * NH * 2 * HD, (int) (NH * 2 * HD)},
+                                             {wk->native_type, wk->native_data, kcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                                             {wv->native_type, wv->native_data, vcur_ + tb * NKV * HD, (int) (NKV * HD)}};
+                const bool qsa_fused = dense_pk_fused_supported(qsa_mats, 3, (int) N, n);
+                if (qsa_fused) native_mmvq_fused(qsa_mats, 3, xq_, (int) N, n, cs);
+                else {
+                    native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                    native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -1004,6 +1022,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 }
                 stamp(l, 9, grp);
+                if (!qsa_fused)
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
                 if (qb) {

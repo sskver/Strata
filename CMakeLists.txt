@@ -325,6 +325,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/elementwise.cu
                           src/kernels/cuda/bf16_gemv.cu
                           src/kernels/cuda/native_mmvq.cu
+                          src/kernels/cuda/dense_pk.cu
                           src/kernels/cuda/native_bf16.cu
                           src/kernels/cuda/native_gr_norm.cu
                           src/kernels/cuda/native_moe.cu
@@ -401,7 +402,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
   if(STRATA_ENABLE_CUDA)
-    set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
+    set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/dense_pk.cu src/kernels/cuda/native_bf16.cu
       src/kernels/cuda/native_gr_norm.cu
       src/kernels/cuda/native_moe.cu
       src/kernels/cuda/native_gdn.cu
@@ -753,6 +754,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(mmvq_multi_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(mmvq_multi_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME mmvq_multi_parity COMMAND mmvq_multi_parity)
+    add_executable(dense_pk_parity src/kernels/dense_pk_parity.cpp)
+    target_include_directories(dense_pk_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(dense_pk_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME dense_pk_parity COMMAND dense_pk_parity --quick)
     if(STRATA_HIP_GFX906)   # the CUDA layout, where the negative control has power (the wave64 one is exact at every T)
       add_test(NAME mmvq_multi_parity_cuda_layout COMMAND mmvq_multi_parity)
       set_tests_properties(mmvq_multi_parity_cuda_layout PROPERTIES ENVIRONMENT "STRATA_MMVQ_WAVE=0")

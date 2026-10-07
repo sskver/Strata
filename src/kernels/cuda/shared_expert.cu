@@ -26,6 +26,7 @@
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/dense_pk.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -225,11 +226,12 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
         x_q8_1 = nw.q8_1;
     }
-    // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
+    // gate and up read the same activation: S26 STRATA_LFUSE (pair) one launch where it applies, else dense_pk's fused
+    // pair launch when it supports the two matrices, else the two calls in order (all bitwise the same)
     if (!(pair && nw.gate_type == nw.up_type &&
           native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok, stream))) {
-        native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
-        native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+        const MmvqMat gu[2] = {{nw.gate_type, nw.gate_data, gate, (int) n_ff}, {nw.up_type, nw.up_data, up, (int) n_ff}};
+        native_mmvq_fused(gu, 2, x_q8_1, (int) n_embd, n_tok, stream);
     }
     const int n = (int) (n_ff * n_tok);
     if (fused_swiglu_q81_enabled()) {

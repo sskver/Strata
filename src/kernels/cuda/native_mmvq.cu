@@ -28,6 +28,7 @@
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "s26_tsum.cuh"
+#include "strata/kernels/dense_pk.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1360,6 +1361,10 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
 #define STRATA_WAVE_MMVQ(...)
 #endif
 
+// dense_pk.cu: the persistent kernels where they are faster and bitwise the same (see dense_pk.hpp), else fall through
+#define STRATA_PK_MMVQ(TYPE) \
+    if (dense_pk_mmvq((TYPE), weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
+
 template<typename Weight, int Qi>
 void small_mmvq(const void* weights, const void* x_q8_1, float* y,
                 int n_in, int n_out, int ncols, void* stream) {
@@ -1871,6 +1876,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     STRATA_WAVE_MMVQ(Q5KTraits)
+    STRATA_PK_MMVQ(13)
     if (ncols > 1) {
         launch_multi<Q5KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -1992,6 +1998,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     STRATA_WAVE_MMVQ(IQ4XSTraits)
+    STRATA_PK_MMVQ(23)
     if (ncols > 1) {
         launch_multi<IQ4XSTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -2073,6 +2080,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     STRATA_WAVE_MMVQ(Q6KTraits)
+    STRATA_PK_MMVQ(14)
     if (ncols > 1) {
         launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -2174,6 +2182,7 @@ void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_iq4_nl_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+    if (dense_pk_mmvq(20, weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     small_mmvq<IQ4NLBlock, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
@@ -2230,7 +2239,10 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 16: case 17: case 18: case 21: case 22: case 29:
+    case 21:
+        if (dense_pk_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); break; }
+        iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 16: case 17: case 18: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
